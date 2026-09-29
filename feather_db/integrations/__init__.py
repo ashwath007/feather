@@ -75,3 +75,12 @@ __all__ = [
     "FeatherVectorStoreIndex",
     "FeatherReader",
 ]
+
+
+# LangGraph long-term memory. Imported lazily — langgraph is optional, and the
+# module must not break `import feather_db.integrations` when it is absent.
+def __getattr__(name):
+    if name == "FeatherStore":
+        from .langgraph_store import FeatherStore
+        return FeatherStore
+    raise AttributeError(name)

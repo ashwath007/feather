@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "feather-db"
-version = "0.18.2"
+version = "0.19.0"
 description = "Embedded vector database + living context engine — multimodal pockets, context graph, adaptive decay, MCP server"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -47,6 +47,9 @@ dev = [
 ]
 examples = [
     "sentence-transformers>=2.0",
+]
+langgraph = [
+    "langgraph>=0.2.0",
 ]
 langchain = [
     "langchain>=0.1.0",

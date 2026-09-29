@@ -11,6 +11,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.19.0] — 2026-09-29
+
+Feather becomes long-term memory for LangGraph agents, and two engine defects
+that undermined it are fixed.
+
+### FeatherStore — Feather as a LangGraph `BaseStore`
+- LangGraph has two memory sockets: `BaseCheckpointSaver` for per-run graph
+  state, and `BaseStore` for **long-term, cross-thread** memory. Feather is the
+  second one, and `BaseStore` needs exactly two methods — `batch()`/`abatch()`.
+- The existing adapters (`FeatherVectorStore`, `FeatherRetriever`) make Feather
+  *a search index an agent queries*. A `BaseStore` makes it *the thing an agent
+  remembers into* — same engine, different position in the stack.
+- Record ids are `sha1(namespace + key)`, **deterministic on purpose**: `put()`
+  on the same key must overwrite in place, since Feather's `id` is a true upsert
+  key. The existing MCP helper seeds ids with `time_ns()`; copying that would
+  have grown the store forever without ever updating anything.
+- `created_at` is preserved across updates while `updated_at` moves, so an agent
+  can tell when it first learned something from when it last confirmed it.
+- Three behaviours are worked around in Python until format v10 lands, and all
+  three are things v10 was already scoped to fix: namespace **prefix** search
+  (the engine's namespace index is exact-match), operator filters (`$gt`/`$lte`
+  over string attributes), and the second timestamp.
+- `examples/langgraph_agent_memory.py` — a runnable agent whose memory survives
+  across processes in a 3 KB file, with no key, server or container.
+- Install with `pip install feather-db[langgraph]`.
+
+### Query dimension was never validated (memory safety)
+- Every distance kernel reads exactly `dim` floats from the query pointer and
+  trusted the caller for the length. A **short** query was therefore an
+  out-of-bounds read — measured, a 256-dim query against a 512-dim index read
+  **1 KB past the end of the buffer** and returned a confident-looking 0.0076. A
+  long query silently compared a truncated prefix.
+- The Cloud API guarded this at the HTTP edge; the C++ core and the Python
+  bindings did not, so every embedded user — the entire point of the product —
+  was unguarded.
+- `search`, `hybrid_search` and `context_chain` now raise `ValueError` naming
+  both dimensions and the modality.
+
+### `auto_link`'s threshold now means cosine
+- It was compared against `1/(1+L2_squared)`, which is not a similarity: the
+  documented default of 0.80 actually required cosine ≥ 0.875, and on
+  unnormalised embeddings it was unreachable. Measured, **20 documents at true
+  cosine 0.9971 produced ZERO links, silently** — and `auto_link` is the
+  primitive the clustering and entity-graph work sits on.
+- The cosine is computed from the vectors rather than derived from the distance,
+  because `cos = 1 − L2sq/2` only holds for unit vectors and nothing in Feather
+  enforces normalisation. Edge weights are now the true cosine too, which
+  matters because they flow into `context_chain` scoring.
+- Same corpus, after: **300 links** at every threshold from 0.80 to 0.99.
+
+### Tests
+`tests/test_query_dim_guard.py` (7), `tests/test_auto_link_threshold.py` (4) and
+`tests/test_langgraph_store.py` (14). The first two were verified against the
+pre-fix engine: **11 of 15 fail**. CI installs langgraph on 3.10+ so the store
+tests run rather than skip. Suite 303 → 318 (+14 more on 3.10+).
+
+
+---
+
 ## [0.18.2] — 2026-09-01
 
 Release plumbing. In 0.18.1 the macOS wheel legs and the CLI binaries built for

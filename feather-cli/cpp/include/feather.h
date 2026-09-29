@@ -1266,6 +1266,20 @@ public:
     // ─────────────────────────────────────────────────────────────────
     // Graph: auto-link by vector similarity
     // ─────────────────────────────────────────────────────────────────
+    // `threshold` is a COSINE similarity in [-1, 1], and it now means that.
+    //
+    // It used to be compared against 1/(1+L2_squared), which is not a similarity
+    // at all: the documented default of 0.80 actually required cosine >= 0.875,
+    // and on unnormalised embeddings it was unreachable — measured, 20 documents
+    // at true cosine 0.9971 produced ZERO links, silently. auto_link is the
+    // primitive the clustering and entity work sits on, so a threshold that
+    // quietly means something else makes the whole feature look broken.
+    //
+    // The cosine is computed from the vectors rather than derived from the L2
+    // distance, because the shortcut cos = 1 - L2sq/2 only holds for unit
+    // vectors and nothing in Feather enforces normalisation. The cost is one
+    // dot product per candidate inside a loop that was already O(n*candidates)
+    // under the exclusive lock.
     size_t auto_link(const std::string& modality = "text",
                      float threshold = 0.80f,
                      const std::string& rel_type = "related_to",
@@ -1277,16 +1291,32 @@ public:
         size_t n = m_idx.index->cur_element_count;
         size_t links_created = 0;
 
+        auto cosine = [&](const std::vector<float>& a, const std::vector<float>& b) -> float {
+            if (a.size() != b.size() || a.empty()) return 0.0f;
+            double dot = 0.0, na = 0.0, nb = 0.0;
+            for (size_t d = 0; d < a.size(); ++d) {
+                dot += static_cast<double>(a[d]) * b[d];
+                na  += static_cast<double>(a[d]) * a[d];
+                nb  += static_cast<double>(b[d]) * b[d];
+            }
+            if (na <= 0.0 || nb <= 0.0) return 0.0f;
+            return static_cast<float>(dot / (std::sqrt(na) * std::sqrt(nb)));
+        };
+
         for (size_t i = 0; i < n; ++i) {
             uint64_t from_id = m_idx.index->getExternalLabel(i);
             // stored data is already in the index's storage format (float or
             // int8), so it can be used directly as the query.
             const void* qdata = m_idx.index->getDataByInternalId(i);
+            std::vector<float> from_vec;
+            try { from_vec = read_vector_label(m_idx, from_id); } catch (...) { continue; }
             auto res = m_idx.index->searchKnn(qdata, candidates + 1);
             while (!res.empty()) {
                 auto [dist, to_id] = res.top(); res.pop();
                 if (to_id == from_id) continue;
-                float sim = 1.0f / (1.0f + dist);
+                std::vector<float> to_vec;
+                try { to_vec = read_vector_label(m_idx, to_id); } catch (...) { continue; }
+                float sim = cosine(from_vec, to_vec);   // true cosine, not 1/(1+L2)
                 if (sim < threshold) continue;
                 auto& meta = metadata_store_[from_id];
                 bool exists = false;
@@ -1335,6 +1365,7 @@ public:
         auto m_it = modality_indices_.find(modality);
         if (m_it == modality_indices_.end()) return {};
         auto& m_idx = m_it->second;
+        check_query_dim(m_idx, query.size(), modality);
 
         // Step 1: vector search → seed nodes (encode query to storage format)
         auto qbytes = encode_query(m_idx, query.data());
@@ -1639,6 +1670,23 @@ public:
         return out;
     }
 
+    // Every distance kernel reads exactly dim floats from the query pointer and
+    // trusts the caller for the length. A short query is therefore an
+    // out-of-bounds READ, not a wrong answer: measured, a 256-dim query against
+    // a 512-dim index read 1 KB past the end of the buffer and returned a
+    // confident-looking score. A long query is merely wrong — it silently
+    // compares a truncated prefix. The Cloud API guarded this at the HTTP edge;
+    // anyone using Feather embedded, which is the whole point of the product,
+    // had no guard at all.
+    void check_query_dim(const ModalityIndex& m_idx, size_t got,
+                         const std::string& modality) const {
+        if (got != m_idx.dim)
+            throw std::invalid_argument(
+                "query vector has " + std::to_string(got) + " dimensions but "
+                "modality '" + modality + "' is " + std::to_string(m_idx.dim) +
+                " — a mismatched query reads past the end of the buffer");
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // Search
     // ─────────────────────────────────────────────────────────────────
@@ -1666,6 +1714,7 @@ public:
         auto m_it = modality_indices_.find(modality);
         if (m_it == modality_indices_.end()) return {};
         auto& m_idx = m_it->second;
+        check_query_dim(m_idx, q.size(), modality);
 
         // ── Pre-filtered exact path (feature A) ──────────────────────
         // When the filter constrains an indexed field (namespace/entity/
@@ -1843,6 +1892,7 @@ public:
             auto m_it = modality_indices_.find(modality);
             if (m_it != modality_indices_.end()) {
                 auto& m_idx = m_it->second;
+                check_query_dim(m_idx, vec.size(), modality);
                 struct FW : public hnswlib::BaseFilterFunctor {
                     const SearchFilter* f_; const std::unordered_map<uint64_t,Metadata>& s_;
                     FW(const SearchFilter* f, const std::unordered_map<uint64_t,Metadata>& s): f_(f),s_(s){}

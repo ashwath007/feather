@@ -31,6 +31,10 @@ jobs:
         # being skipped. Those tests guard the endpoint-agreement invariant that
         # a production incident traced back to (see that file's docstring).
         pip install fastapi httpx python-multipart
+        # langgraph so tests/test_langgraph_store.py runs instead of skipping —
+        # it is the adapter that puts Feather inside an agent, so it must not rot.
+        # 3.9 is excluded: langgraph requires >=3.10.
+        if [ "${{ matrix.python-version }}" != "3.9" ]; then pip install langgraph; fi
 
     - name: Build C++ extension
       run: python setup.py build_ext --inplace
