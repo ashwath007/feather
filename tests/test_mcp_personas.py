@@ -104,13 +104,21 @@ def test_recall_reaches_memories_too_cold_to_be_carried(tmp_path):
 
     async def go():
         async with session(path, "me.assistant", budget_tokens=200) as mcp:
-            await mcp.call("remember", key="passport",
+            # Importance, not write order, is what makes this one cold. Every
+            # record here is written in the same second with recall_count 0, so
+            # heat TIES — and with tied heat which records get carried falls out
+            # of hash-map iteration order, which differs between libc++ and
+            # libstdc++. This test passed on macOS and failed on Linux CI for
+            # exactly that reason. Low importance makes it reliably last.
+            await mcp.call("remember", key="passport", importance=0.1,
                            content="passport number expires in March 2031")
             for i in range(40):
-                await mcp.call("remember", key=f"noise_{i}",
+                await mcp.call("remember", key=f"noise_{i}", importance=1.0,
                                content=f"unrelated conversational filler number {i}")
 
-            assert "passport" not in await mcp.call("context")
+            assert "passport" not in await mcp.call("context"), \
+                "the coldest record was still carried; the budget did not bind"
+            # but it is not gone — recall searches warm storage too
             assert "2031" in await mcp.call("recall", query="passport expiry")
 
     asyncio.run(go())
