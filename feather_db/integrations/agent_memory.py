@@ -60,6 +60,16 @@ def _slug(text: str, limit: int = 40) -> str:
     return _SLUG.sub("_", text.lower()).strip("_")[:limit] or "item"
 
 
+def _event_time(meta) -> float:
+    """Event time from an episode key, `<unix>_<slug>`. Falls back to the engine
+    timestamp for anything not written by _Episodes.record()."""
+    head = (meta.entity_id or "").split("_", 1)[0]
+    try:
+        return float(head)
+    except ValueError:
+        return float(meta.timestamp)
+
+
 class _Kind:
     """One kind of memory, bound to its namespace. Not constructed directly."""
 
@@ -81,16 +91,29 @@ class _Kind:
         return item.value if item else None
 
     def all(self, limit: int = 100) -> list[dict]:
-        """Every item of this kind, newest first."""
-        items = self._mem.store.search(self.namespace, query=None, limit=limit)
-        return sorted((i.value for i in items),
-                      key=lambda v: v.get("recorded_at", 0), reverse=True)
+        """Every item of this kind, newest first.
+
+        Uses the store's `newest`, not `search`. `search` has no ordering, so
+        sorting its arbitrary slice returned the newest of a random subset and
+        silently dropped real records.
+
+        Ordering is by the engine timestamp, which has one-second resolution, so
+        items written within the same second are in arbitrary order relative to
+        each other. That is fine for the kinds this matters for — preferences,
+        facts and procedures are upserted by key and few — and `_Episodes`
+        overrides it. Sub-second ordering needs the second timestamp field
+        format v10 is scoped to carry.
+        """
+        return [i.value for i in self._mem.store.newest(self.namespace, limit)]
 
     def delete(self, key: str) -> None:
         self._mem.store.delete(self.namespace, key)
 
     def __len__(self) -> int:
-        return len(self._mem.store.search(self.namespace, query=None, limit=1000))
+        # A count, not a fetch. The old version pulled 1000 items and parsed
+        # every one's JSON just to call len() on the list — 17 ms at 2000
+        # memories, and wrong past 1000.
+        return self._mem.store.count(self.namespace)
 
     def __repr__(self) -> str:
         return f"<{self.kind} {'.'.join(self.namespace)} n={len(self)}>"
@@ -115,10 +138,27 @@ class _Episodes(_Kind):
         return self._write(key, {"text": what, "outcome": outcome,
                                  "happened_at": at, **extra}, ttl=ttl)
 
+    def all(self, limit: int = 100) -> list[dict]:
+        """Episodes order by event time, not by write time — same as recent().
+
+        The generic `all()` sorts on the engine timestamp, which is whole
+        seconds, so 300 episodes written in one second tie and come back in an
+        arbitrary order: asking for 3 returned events 298, 297, 296 rather than
+        299, 298, 297.
+        """
+        return [i.value for i in
+                self._mem.store.newest(self.namespace, limit, key=_event_time)]
+
     def recent(self, limit: int = 10) -> list[dict]:
-        items = self._mem.store.search(self.namespace, query=None, limit=limit * 4)
-        return sorted((i.value for i in items),
-                      key=lambda v: v.get("happened_at", 0), reverse=True)[:limit]
+        """The `limit` most recent episodes, by when they HAPPENED.
+
+        Sorted on the event time encoded in the key rather than on the value's
+        `happened_at`, so no JSON is parsed for the records that lose. An
+        episode may be backdated with `at=`, so the engine's own timestamp (when
+        it was written) is the wrong field here.
+        """
+        return [i.value for i in
+                self._mem.store.newest(self.namespace, limit, key=_event_time)]
 
 
 class _Facts(_Kind):
@@ -247,7 +287,7 @@ class AgentMemory:
                      "entities", "observations"):
             kind = getattr(self, name)
             out[name] = 0 if isinstance(kind.namespace, _Missing) else len(kind)
-        return out
+        return out   # len() is now a count, so this is six cheap scans
 
     def __repr__(self) -> str:
         who = ", ".join(f"{k}={v}" for k, v in

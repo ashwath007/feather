@@ -75,6 +75,11 @@ def build(
 
     if db is None:
         db = DB.open(db_path, dim=dim)
+    if embed is None:
+        # Same env default as FeatherStore, so `feather-agent` with
+        # FEATHER_EMBED_PROVIDER set gets semantic recall without --embed-provider.
+        from feather_db.integrations.embedders import default_embedder
+        embed = default_embedder(dim)
     pkt = Pocket(db, _scope(scope), budget_tokens=budget_tokens, embed=embed)
 
     server = MCPServer(

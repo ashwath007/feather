@@ -283,3 +283,47 @@ def test_batch_applies_every_op_in_order(store):
     results = store.batch(ops)
     assert results[-1] is not None and results[-1].value["n"] == 2
     assert len(store.search(NS, limit=20)) == 5
+
+
+# ── embedder defaults from the environment ────────────────────────────────
+
+def test_no_provider_configured_means_keyword_only(tmp_path, monkeypatch):
+    monkeypatch.delenv("FEATHER_EMBED_PROVIDER", raising=False)
+    store = FeatherStore(str(tmp_path / "a.feather"), dim=32)
+    try:
+        assert store._embed is None          # falls back to BM25
+    finally:
+        store.close()
+
+
+def test_a_configured_provider_is_picked_up_without_threading_it_through(tmp_path, monkeypatch):
+    """The point of the default: a deployment sets one env var and every
+    FeatherStore gets semantic recall, instead of each call site passing embed."""
+    monkeypatch.setenv("FEATHER_EMBED_PROVIDER", "hash")
+    store = FeatherStore(str(tmp_path / "b.feather"), dim=32)
+    try:
+        assert store._embed is not None
+        assert len(store._embed("some text")) == 32
+    finally:
+        store.close()
+
+
+def test_an_explicit_embedder_still_wins_over_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("FEATHER_EMBED_PROVIDER", "hash")
+    sentinel = lambda text: [0.0] * 32
+    store = FeatherStore(str(tmp_path / "c.feather"), dim=32, embed=sentinel)
+    try:
+        assert store._embed is sentinel
+    finally:
+        store.close()
+
+
+def test_a_broken_provider_fails_loudly_instead_of_degrading(tmp_path, monkeypatch):
+    """Silently falling back to keyword search is the worst outcome: BM25 does
+    no stemming, so a paraphrased query returns nothing and the caller cannot
+    tell a misconfiguration from a memory that was never stored."""
+    monkeypatch.setenv("FEATHER_EMBED_PROVIDER", "openai")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("FEATHER_EMBED_API_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="API key"):
+        FeatherStore(str(tmp_path / "d.feather"), dim=32)

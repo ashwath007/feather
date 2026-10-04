@@ -164,6 +164,14 @@ class FeatherStore(BaseStore):
         _require_langgraph()
         self.db = DB.open(path, dim=dim)
         self.dim = dim
+        if embed is None:
+            # Default to whatever the environment configures
+            # (FEATHER_EMBED_PROVIDER / FEATHER_EMBED_MODEL), so a deployment
+            # gets real semantic recall without every call site threading an
+            # embedder through. None still means keyword-only; a provider that
+            # is set but broken raises here rather than degrading silently.
+            from feather_db.integrations.embedders import default_embedder
+            embed = default_embedder(dim)
         self._embed = embed
         self._index_fields = index_fields
         self._auto_save = auto_save
@@ -359,6 +367,56 @@ class FeatherStore(BaseStore):
             updated_at=_dt(meta.timestamp),
         )
         return SearchItem(score=score, **common) if score is not None else Item(**common)
+
+    # ── extensions beyond BaseStore ──────────────────────────────────────
+    # BaseStore's `search` has no ordering and no cheap count, so anything that
+    # wants "the newest N" or "how many" had to fetch and materialise the whole
+    # namespace. These three give callers a bounded path. They are NOT part of
+    # the LangGraph interface — a plain BaseStore consumer never sees them.
+
+    def scan(self, namespace: tuple[str, ...], *, prefix: bool = False):
+        """Live (id, metadata) rows in a namespace. Does not parse the value.
+
+        The value is a JSON blob in an attribute, and parsing it is most of the
+        cost of building an Item. Callers that only need to count, or to sort on
+        a metadata field, should never pay it.
+        """
+        ids = (self._ids_under(namespace) if prefix
+               else self.db.ids_in_namespace(NS_SEP.join(namespace)))
+        now = time.time()
+        out = []
+        for rid in ids:
+            meta = self.db.get_metadata(rid)
+            if meta is None or _is_dead(meta, now):
+                continue
+            out.append((rid, meta))
+        return out
+
+    def count(self, namespace: tuple[str, ...], *, prefix: bool = False) -> int:
+        """How many live items. Cannot use the engine's namespace_size(), which
+        counts tombstones — forgotten records stay in the namespace index until
+        compaction, so it would report deleted memories as present."""
+        return len(self.scan(namespace, prefix=prefix))
+
+    def newest(self, namespace: tuple[str, ...], limit: int = 10, *,
+               key=None, prefix: bool = False) -> list[Any]:
+        """The `limit` most recent items, newest first.
+
+        Exists because `search(limit=n)` cannot answer this. It has no ordering,
+        so it returns an arbitrary n and a caller sorting those n is sorting the
+        wrong set — at 300 episodes, asking for the 5 newest returned events
+        299, 298, 296, 295, 293, silently skipping two.
+
+        `key(meta)` picks the sort field, defaulting to the engine timestamp
+        (updated_at). Only the surviving `limit` rows get their value parsed.
+        """
+        rows = self.scan(namespace, prefix=prefix)
+        getter = key or (lambda m: m.timestamp)
+        rows.sort(key=lambda r: getter(r[1]), reverse=True)
+        return [self._to_item(
+                    tuple(m.namespace_id.split(NS_SEP)) if m.namespace_id else (),
+                    m.entity_id, m)
+                for _, m in rows[:limit]]
 
     def close(self) -> None:
         self.db.save()

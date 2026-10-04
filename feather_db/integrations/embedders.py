@@ -116,6 +116,27 @@ def _hash_embedder(dim: int) -> Callable[[str], List[float]]:
     return embed
 
 
+def default_embedder(dim: int = 768, *, provider: Optional[str] = None,
+                     model: Optional[str] = None):
+    """Build an embedder from the environment, or return None if none is set.
+
+    Reads `FEATHER_EMBED_PROVIDER` and `FEATHER_EMBED_MODEL`. Returns None when
+    no provider is configured, so a caller can fall back to keyword search.
+
+    If a provider IS configured but cannot be built — missing key, unknown name
+    — this raises instead of returning None. A silent fall back to keyword
+    search would be the worst outcome: BM25 does no stemming, so a paraphrased
+    query returns "nothing found", and the caller cannot tell a
+    misconfiguration from a memory the agent genuinely never had. Better to
+    fail at startup than to look like amnesia at runtime.
+    """
+    provider = provider or os.getenv("FEATHER_EMBED_PROVIDER")
+    if not provider:
+        return None
+    return make_embedder(provider, model=model or os.getenv("FEATHER_EMBED_MODEL"),
+                         dim=dim)
+
+
 def make_embedder(provider: str, model: Optional[str] = None,
                   api_key: Optional[str] = None, dim: int = 768,
                   base_url: Optional[str] = None) -> Callable[[str], List[float]]:

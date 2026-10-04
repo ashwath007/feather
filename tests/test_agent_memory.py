@@ -241,3 +241,83 @@ def test_the_langgraph_example_still_runs(tmp_path, monkeypatch):
 
     assert "written async" in out["reply"]
     assert "2 time(s)" in out["reply"]
+
+
+# ── ordering and counting at scale ────────────────────────────────────────
+# These exist because the first implementation was wrong and the tests above
+# did not catch it: with two episodes, "the newest 1 of an arbitrary 8" and
+# "the newest 1" are the same answer. They stop being the same at 300.
+
+def test_recent_returns_the_actually_newest_episodes(mem):
+    """`recent()` used to ask search() for limit*4 items and sort those.
+    search() has no ordering, so it sorted an arbitrary subset: at 300 episodes
+    the newest 5 came back as 299, 298, 296, 295, 293 — silently skipping two.
+    """
+    base = time.time()
+    for i in range(300):
+        mem.episodes.record(f"event {i}", at=base + i)
+
+    assert [v["text"] for v in mem.episodes.recent(5)] == \
+        [f"event {i}" for i in (299, 298, 297, 296, 295)]
+
+
+def test_episodes_all_orders_by_event_time_not_write_time(mem):
+    """The generic all() sorts on the engine timestamp, which is whole seconds,
+    so 300 records written inside one second tie and order arbitrarily — that
+    returned 298, 297, 296 for the newest three. Episodes override it."""
+    base = time.time()
+    for i in range(300):
+        mem.episodes.record(f"event {i}", at=base + i)
+
+    assert [v["text"] for v in mem.episodes.all(3)] == \
+        [f"event {i}" for i in (299, 298, 297)]
+
+
+def test_a_backdated_episode_sorts_by_when_it_happened(mem):
+    """`at=` exists so a past event can be recorded now. Sorting on write time
+    would put it first, which is the opposite of the truth."""
+    now = time.time()
+    mem.episodes.record("happened last year", at=now - 365 * 86400)
+    mem.episodes.record("happened an hour ago", at=now - 3600)
+
+    assert mem.episodes.recent(1)[0]["text"] == "happened an hour ago"
+
+
+def test_len_is_exact_beyond_the_old_thousand_item_fetch(mem):
+    """len() used to fetch 1000 items and measure the list, so it was both slow
+    and silently capped. 1200 records reported 1000."""
+    base = time.time()
+    for i in range(1200):
+        mem.episodes.record(f"event {i}", at=base + i)
+
+    assert len(mem.episodes) == 1200
+    assert mem.summary()["episodes"] == 1200
+
+
+def test_counting_excludes_deleted_records(mem):
+    """The engine's namespace_size() counts tombstones — forgotten records stay
+    in the namespace index until compaction — so it would report deleted
+    memories as present. count() checks liveness."""
+    mem.preferences.set("a", "first")
+    mem.preferences.set("b", "second")
+    assert len(mem.preferences) == 2
+
+    mem.preferences.delete("a")
+    assert len(mem.preferences) == 1
+    assert mem.preferences.get("a") is None
+
+
+def test_the_store_primitives_are_bounded(mem):
+    """`newest` must parse only what it returns, and `count` must parse nothing
+    — that is the whole reason they exist next to search()."""
+    base = time.time()
+    for i in range(500):
+        mem.episodes.record(f"event {i}", at=base + i)
+
+    ns = mem.episodes.namespace
+    assert mem.store.count(ns) == 500
+    assert len(mem.store.newest(ns, 7)) == 7
+    assert len(mem.store.scan(ns)) == 500
+    # scan returns (id, metadata) and never touches the value JSON
+    rid, meta = mem.store.scan(ns)[0]
+    assert isinstance(rid, int) and meta.namespace_id == ".".join(ns)
