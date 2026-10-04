@@ -7,7 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.20.0] — 2026-10-04
+
+Agent memory, end to end: a tiered pocket per agent, a typed store for the five
+kinds of thing an agent remembers, and an MCP surface that is now tested over
+the actual protocol rather than by calling its own functions.
+
+### AgentMemory — the five kinds of thing an agent stores
+
+`FeatherStore` is a correct `BaseStore`, and deliberately generic: it will store
+anything under any namespace you invent. An agent memory is not generic. Five
+kinds get stored, they have different lifetimes, and the difference is not
+decorative — write an episode with upsert semantics and you have destroyed the
+history that made it an episode; write a preference append-only and the agent
+holds six contradictory answers to "how do they want to be contacted" with no
+way to tell which is current.
+
+| kind | semantics | namespace |
+|---|---|---|
+| preferences | revised in place | `(org, user, "preferences")` |
+| episodes | append-only, time-keyed | `(org, user, "episodes")` |
+| facts | corrected, keeps `supersedes` | `(org, brand, "facts")` |
+| procedures | versioned as `name@N` | `(org, agent, "procedures")` |
+| entities | merged, org-wide | `(org, "entities")` |
+| observations | cites its evidence | `(org, user, "observations")` |
+
+The kind determines the write semantics, so the kind is now in the API rather
+than in the caller's head.
+
+It also owns namespace **ordering**. Search takes a prefix, so
+`(org, subject, kind)` makes "everything I know about this user" a prefix read
+while `(org, kind, subject)` makes it a filter over every user in the org — same
+data, and the second does not scale. A caller cannot invert it. A kind whose
+subject was never supplied raises naming the missing argument instead of
+surfacing as an opaque tuple error three frames down.
+
+`examples/langgraph_agent_memory.py` adds memory to an existing LangGraph agent
+by changing one line (`builder.compile(store=...)`). It runs offline with a
+bag-of-words stand-in embedder, and is **executed by a test** rather than read.
+
+### The MCP server is now tested over the protocol, not by calling itself
+
+The previous tests called `server.call_tool()` directly. That tests the Python
+functions; it does not test the server. The JSON Schema the SDK derives from the
+type hints, argument validation, the initialize handshake, result envelopes and
+error signalling were all skipped — and that layer is exactly where an MCP
+server breaks for a user while every unit test stays green. The old
+`mcp_server` module is the proof: it passed its own tests and raised on import
+against SDK 2.0.
+
+`tests/mcp_harness.py` runs a real `ClientSession` over the SDK's in-memory
+transport — the same JSON-RPC messages Claude Desktop sends over stdio, with no
+subprocess. 23 protocol tests and 12 persona tests (a personal assistant across
+four restarts with a correction and a forget; a pinned safety fact surviving 40
+junk memories under budget pressure; an agency with inherited policy and brand
+isolation; a 50-agent fleet).
+
+CI and `verify.sh` now **fail if the MCP suite skips** rather than runs.
+`importorskip` turns a missing SDK into a green skip, which is precisely how the
+old server shipped broken with CI passing.
+
+### `recall()` ranked by heat, so it ignored the query
+
+A pinned record has heat 1.0 by definition, so an org compliance policy was
+returned first for "which tiktok creative performed best" exactly as readily as
+for "what should I not claim". Heat answers *what should I be carrying*;
+relevance answers *what did you ask for*; only `hot()` may conflate them.
+Scores are now normalised per scope (each scope is searched separately, so raw
+scores are not comparable across them) and ranked by relevance with heat as a
+0.05 tiebreaker — at 0.15 a pinned row still beat one scoring 0.04 higher.
+
+### `build(db=...)` — the correct pattern for several agents
+
+Two `DB.open` calls on one path are two independent instances with independent
+in-memory state, and whichever saves last overwrites the other's records
+(measured: 1 of 2 survived). So giving each agent its own MCP server on a shared
+file silently loses memory. `build(db=...)` runs a scope against an
+already-open database; one DB with many scopes is safe. A test asserts the
+collision **still happens**, so if it ever stops failing, file locking landed.
+
+> **Known limit, unchanged:** two *processes* writing one `.feather` still
+> destroy each other's writes. Single-process, many-agent use is safe via
+> scopes; multi-process is not yet.
+
 
 ### FeatherStore now honours the whole `BaseStore` contract
 Four behaviours the LangGraph interface specifies that the first implementation

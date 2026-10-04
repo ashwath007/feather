@@ -50,4 +50,4 @@ __all__ = [
 ]
 from .pocket import Pocket, PocketItem, pocket  # noqa: E402
 
-__version__ = "0.19.0"
+__version__ = "0.20.0"

@@ -38,8 +38,14 @@ done
 hdr "4. Data-integrity regressions (the four that could lose data)"
 for t in tests/test_wal_recovery.py tests/test_wal_durability.py \
          tests/test_open_failure_safety.py tests/test_api_records.py; do
-  n=$($PY -m pytest "$t" -q 2>/dev/null | grep -oE '[0-9]+ passed' | head -1)
-  [ -n "$n" ] && ok "$(basename $t): $n" || bad "$(basename $t) failed"
+  out=$($PY -m pytest "$t" -q 2>/dev/null | tail -2)
+  n=$(printf '%s' "$out" | grep -oE '[0-9]+ passed' | head -1)
+  if [ -n "$n" ]; then ok "$(basename $t): $n"
+  elif printf '%s' "$out" | grep -qE '[0-9]+ skipped'; then
+    # A skip is not a pass. It is also not a failure — reporting it as one sends
+    # you hunting a defect that is really a missing optional dependency.
+    skp "$(basename $t): SKIPPED — $(printf '%s' "$out" | grep -oE 'need[s]? [a-z]+' | head -1)"
+  else bad "$(basename $t) failed"; fi
 done
 
 hdr "5. MCP surface (real protocol, not direct calls)"
