@@ -86,9 +86,48 @@ file silently loses memory. `build(db=...)` runs a scope against an
 already-open database; one DB with many scopes is safe. A test asserts the
 collision **still happens**, so if it ever stops failing, file locking landed.
 
-> **Known limit, unchanged:** two *processes* writing one `.feather` still
-> destroy each other's writes. Single-process, many-agent use is safe via
-> scopes; multi-process is not yet.
+### Inter-process file locking — the silent multi-process data loss is closed
+
+Two processes opening one `.feather`, each writing, each saving, both exiting 0
+— and 20 of 20 records from one of them gone. No error, no log. Each DB holds
+the whole dataset in RAM and `save_vectors()` rewrites the file from that view,
+so the second save writes a view that never contained the first's records.
+
+This is not fixable by serialising the saves: a mutex would only decide whose
+records vanish. True concurrent writing needs merge-on-save or a paged storage
+engine, which is a format change. So what ships is enforcement of the model that
+**is** safe — one writer, many readers — with a loud refusal in place of silent
+loss:
+
+- `DB.open()` takes an exclusive advisory lock (`flock`) for the handle's
+  lifetime. A second **process** is refused, naming the holder's pid and the
+  single-writer model.
+- `DB.open(..., read_only=True)` takes a *shared* lock instead, so any number of
+  reader processes may hold the file at once. Every mutation on a read-only
+  handle raises at the call site — not at save time, because a handle that
+  accepts `add()` and only complains on checkpoint has already lied to the
+  caller. A read-only close never rewrites the file.
+- `db.close()` checkpoints, releases the WAL handle and drops the lock. It is
+  **required**, not decorative: the Python binding holds `DB` with
+  `py::nodelete`, so `~DB()` never runs from Python and without `close()` the
+  lock would live until process exit. `with DB.open(...) as db:` also works.
+- The lock is **reentrant within one process**, so a program may still reopen
+  its own file — a strict lock would have refused that, since `del db` cannot
+  release one. Same-process double-open therefore remains the documented footgun
+  it already was (use one handle and separate agents by namespace, or
+  `build(db=...)`); what is now impossible is the cross-process case, where you
+  collide with a process you cannot see.
+- `FEATHER_LOCK=0` disables it, because `flock` is unreliable on NFS and some
+  container overlay mounts. The caller then owns the consequence.
+- A crashed writer does not strand the file: `flock` is released by the kernel
+  on process death, and a leftover `.lock` file is not itself a lock.
+
+11 tests, including the original report reproduced end to end across two real
+processes.
+
+> **Note for mixed Python/CLI use:** the Rust CLI now also participates. If a
+> long-running Python process holds a database, `feather add --db that.feather`
+> is refused rather than silently discarding one side's writes.
 
 
 ### FeatherStore now honours the whole `BaseStore` contract

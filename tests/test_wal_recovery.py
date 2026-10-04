@@ -93,7 +93,8 @@ def test_corrupt_wal_length_does_not_allocate_wildly(tmp_path):
     m = feather_db.Metadata(); m.content = "seed"
     db.add(1, np.random.rand(16).astype(np.float32), m)
     db.save()
-    del db
+    db.close()      # hand the file to the child process: `del` cannot release
+    del db          # the inter-process lock, because DB is bound py::nodelete
 
     with open(path + ".wal", "wb") as fh:
         fh.write(struct.pack("<B", 0x01))         # WalOp::ADD

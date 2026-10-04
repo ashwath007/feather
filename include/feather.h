@@ -18,6 +18,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <array>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/file.h>      // flock
+#else
+#include <io.h>
+#include <windows.h>
+#endif
 #if defined(_WIN32)
 #  include <io.h>          // _commit / _fileno for the WAL fsync
 #else
@@ -51,6 +59,30 @@ private:
     std::unordered_map<std::string, ModalityIndex> modality_indices_;
     std::string path_;
     std::string wal_path_;
+
+    // ── Inter-process locking ────────────────────────────────────────────
+    // Held for the whole lifetime of the handle, on a sidecar `<path>.lock`.
+    //
+    // What this does and does not buy, because the distinction matters: it does
+    // NOT make two processes able to write one file concurrently. It cannot.
+    // Each DB holds the entire dataset in RAM and save_vectors() rewrites the
+    // file from that in-memory view, so even a mutex around save() would have
+    // process B write B's view — which never contained A's records. A's writes
+    // vanish, both processes exit 0. Measured before this change: 20 of 20
+    // records lost. Concurrent writing needs merge-on-save or a paged storage
+    // engine; that is a format change, not a lock.
+    //
+    // What it does buy is ENFORCEMENT of the model that is actually safe:
+    // one writer, many readers. A second writer is refused with the holder's
+    // pid instead of silently destroying data, and a reader takes a shared
+    // lock so it cannot be running while a writer rewrites the file underneath
+    // it. Loud and recoverable beats silent and not.
+    std::string lock_path_;
+    int  lock_fd_   = -1;
+    bool read_only_ = false;
+    bool closed_    = false;
+    std::string lock_key_;        // canonical path, key into the registry
+    bool reentrant_ = false;      // admitted against a lock this process holds
 
     // Set as the very last act of load_vectors(). Guards the destructor and
     // save_vectors() so a partially-read file is never written back. See ~DB().
@@ -668,6 +700,209 @@ private:
 #endif
     }
 
+    // ── Advisory file lock ───────────────────────────────────────────────
+
+    // ── In-process lock registry ─────────────────────────────────────────
+    // flock() conflicts between two open file descriptions even inside ONE
+    // process, which would make the lock a breaking change: the Python binding
+    // holds DB with py::nodelete, so `del db` never runs ~DB(), and any program
+    // that reopened its own file — including most of our own tests — would be
+    // refused by a lock it already held.
+    //
+    // So the lock is REENTRANT per process. The first handle takes the flock;
+    // further handles on the same path in the same process are admitted against
+    // a refcount. The guarantee that matters is unchanged, because the hazard
+    // this fixes is cross-process: two processes, each with a full in-memory
+    // copy, each rewriting the whole file (measured: 20 of 20 records lost,
+    // both exiting 0). Same-process double-open remains the documented footgun
+    // it already was — use one handle and separate agents by namespace, or
+    // build(db=...) — and it is the caller's own state, not a silent collision
+    // with a process they cannot see.
+    static std::mutex& registry_mutex() {
+        static std::mutex m;
+        return m;
+    }
+    static std::unordered_map<std::string, int>& registry() {
+        static std::unordered_map<std::string, int> held;
+        return held;
+    }
+
+    /// Resolve to a canonical key so "./a.feather" and "a.feather" are one entry.
+    ///
+    /// Canonicalises the DIRECTORY and appends the basename, never the file
+    /// itself. realpath() on the file only succeeds once the file exists, and on
+    /// macOS it rewrites /var/folders/... to /private/var/folders/... — so
+    /// keying on the file gave one key before the first save and a different one
+    /// after. Reentrancy then missed, the handle took a second flock against one
+    /// this same process already held, and the failure was reported as "another
+    /// process (pid <ourselves>)". The directory exists in both cases, so this
+    /// key is stable across the file's creation.
+    static std::string lock_key(const std::string& path) {
+#ifndef _WIN32
+        size_t slash = path.find_last_of('/');
+        std::string dir  = (slash == std::string::npos) ? "." : path.substr(0, slash);
+        std::string base = (slash == std::string::npos) ? path : path.substr(slash + 1);
+        if (dir.empty()) dir = "/";
+        char buf[4096];
+        if (::realpath(dir.c_str(), buf)) return std::string(buf) + "/" + base;
+#endif
+        return path;
+    }
+
+    static bool locking_enabled() {
+        const char* e = std::getenv("FEATHER_LOCK");
+        // Opt-out exists because flock() is unreliable on NFS and some
+        // container overlay mounts, where a spurious failure to lock would be
+        // worse than no lock at all.
+        return !(e && (e[0] == '0' || e[0] == 'n' || e[0] == 'N'));
+    }
+
+    /// Read the pid recorded by whoever holds the lock, for the error message.
+    /// Best-effort: an empty or unreadable file just yields "unknown".
+    std::string lock_holder() const {
+        std::ifstream f(lock_path_);
+        std::string pid;
+        if (f && std::getline(f, pid) && !pid.empty()) return pid;
+        return "unknown";
+    }
+
+    void acquire_lock(bool exclusive) {
+        if (!locking_enabled()) return;
+        lock_path_ = path_ + ".lock";
+        lock_key_  = lock_key(path_);
+        {
+            std::lock_guard<std::mutex> g(registry_mutex());
+            auto it = registry().find(lock_key_);
+            if (it != registry().end() && it->second > 0) {
+                it->second += 1;        // this process already holds it
+                reentrant_ = true;
+                return;
+            }
+        }
+#ifndef _WIN32
+        int fd = ::open(lock_path_.c_str(), O_RDWR | O_CREAT, 0644);
+        if (fd < 0) return;        // unwritable dir: proceed rather than refuse
+        if (::flock(fd, (exclusive ? LOCK_EX : LOCK_SH) | LOCK_NB) != 0) {
+            std::string holder = lock_holder();
+            ::close(fd);
+            // flock() conflicts between two open file descriptions even in ONE
+            // process, and that is the mistake people actually make — so say so
+            // rather than reporting "another process (pid <yourself>)".
+            // Backstop for the case the registry missed: if the lock file
+            // names our own pid we already hold this lock, so admit the handle
+            // reentrantly instead of reporting ourselves as another process.
+            if (holder == std::to_string(static_cast<long>(::getpid()))) {
+                std::lock_guard<std::mutex> g(registry_mutex());
+                registry()[lock_key_] += 1;
+                reentrant_ = true;
+                return;
+            }
+            throw std::runtime_error(
+                std::string(exclusive
+                    ? "Cannot open '" + path_ + "' for writing: another process "
+                      "(pid " + holder + ") holds the write lock.\n"
+                    : "Cannot open '" + path_ + "' for reading: a writer "
+                      "(pid " + holder + ") holds it exclusively.\n") +
+                "Feather is single-writer: one process writes, many may read. "
+                "Set FEATHER_LOCK=0 to disable this check (you then own the "
+                "consequence: concurrent writers silently discard each other's "
+                "records).");
+        }
+        lock_fd_ = fd;
+        {
+            std::lock_guard<std::mutex> g(registry_mutex());
+            registry()[lock_key_] = 1;
+        }
+        if (exclusive) {           // record who holds it, for the next caller
+            if (::ftruncate(fd, 0) == 0) {
+                std::string pid = std::to_string(static_cast<long>(::getpid())) + "\n";
+                ssize_t n = ::write(fd, pid.c_str(), pid.size());
+                (void)n;           // advisory only; a short write costs nothing
+            }
+        }
+#else
+        // Windows: LockFileEx on a sidecar handle. Same semantics, different API.
+        HANDLE h = CreateFileA(lock_path_.c_str(), GENERIC_READ | GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h == INVALID_HANDLE_VALUE) return;
+        OVERLAPPED ov = {};
+        DWORD flags = LOCKFILE_FAIL_IMMEDIATELY | (exclusive ? LOCKFILE_EXCLUSIVE_LOCK : 0);
+        if (!LockFileEx(h, flags, 0, 1, 0, &ov)) {
+            CloseHandle(h);
+            throw std::runtime_error("Cannot open '" + path_ +
+                "': another process holds the lock. Feather is single-writer.");
+        }
+        lock_fd_ = static_cast<int>(reinterpret_cast<intptr_t>(h));
+#endif
+    }
+
+    /// Refuse a mutation on a read-only handle.
+    ///
+    /// Checked at the mutation rather than at save() because a read-only handle
+    /// that accepts add() and only complains at checkpoint time has already lied
+    /// to the caller: the record looked stored, the process exits, nothing is
+    /// there. Failing at the call site makes the mistake findable.
+    void check_writable(const char* what) const {
+        if (closed_)
+            throw std::runtime_error(
+                std::string("Cannot ") + what + ": '" + path_ + "' is closed.");
+        if (read_only_)
+            throw std::runtime_error(
+                std::string("Cannot ") + what + ": '" + path_ +
+                "' was opened read-only. Reopen with read_only=false (and make "
+                "sure no other process holds the write lock).");
+    }
+
+public:
+    /// Checkpoint, release the WAL handle and drop the inter-process lock.
+    ///
+    /// Required rather than decorative: the Python binding holds DB with
+    /// py::nodelete, so ~DB() never runs from Python and the lock would survive
+    /// until process exit — making a file unreopenable by the very process that
+    /// opened it. Idempotent.
+    void close() {
+        if (closed_) return;
+        if (load_complete_ && !read_only_) {
+            try { save_vectors(); } catch (...) {}
+        }
+        wal_close();
+        release_lock();
+        closed_ = true;
+    }
+
+    bool is_read_only() const { return read_only_; }
+    bool is_closed()    const { return closed_; }
+
+private:
+    void release_lock() {
+        if (!lock_key_.empty()) {
+            std::lock_guard<std::mutex> g(registry_mutex());
+            auto it = registry().find(lock_key_);
+            if (it != registry().end() && --it->second > 0) {
+                lock_key_.clear();
+                return;             // other handles in this process still open
+            }
+            if (it != registry().end()) registry().erase(it);
+            lock_key_.clear();
+        }
+        if (reentrant_ || lock_fd_ < 0) return;
+#ifndef _WIN32
+        ::flock(lock_fd_, LOCK_UN);
+        ::close(lock_fd_);
+#else
+        HANDLE h = reinterpret_cast<HANDLE>(static_cast<intptr_t>(lock_fd_));
+        OVERLAPPED ov = {};
+        UnlockFileEx(h, 0, 1, 0, &ov);
+        CloseHandle(h);
+#endif
+        lock_fd_ = -1;
+        // The .lock file itself is left in place deliberately. flock state
+        // lives on the descriptor, not the inode, so unlinking it races with a
+        // waiter that has already opened it and would hand two processes
+        // independent locks on two different inodes.
+    }
+
     void wal_close() const {
         if (wal_file_) { std::fclose(wal_file_); wal_file_ = nullptr; }
     }
@@ -834,6 +1069,7 @@ private:
     // ── Persistence ─────────────────────────────────────────────────
 
     void save_vectors() const {
+        check_writable("save");
         // A DB whose load threw holds a fragment of the file, not its contents.
         // Writing that back is data loss, so refuse loudly rather than silently
         // truncating. The destructor checks the same flag before calling in.
@@ -1090,11 +1326,22 @@ public:
     // ─────────────────────────────────────────────────────────────────
     // Factory
     // ─────────────────────────────────────────────────────────────────
-    static std::unique_ptr<DB> open(const std::string& path, size_t default_dim = 768) {
+    /// Open a database. `read_only` takes a SHARED lock, so any number of
+    /// readers may hold the file at once; the default takes an EXCLUSIVE one and
+    /// refuses if another process already has it. See the lock_path_ comment for
+    /// why this is enforcement of single-writer rather than concurrent writing.
+    static std::unique_ptr<DB> open(const std::string& path, size_t default_dim = 768,
+                                    bool read_only = false) {
         auto db = std::make_unique<DB>();
         db->path_        = path;
         db->wal_path_    = path + ".wal";
         db->default_dim_ = default_dim;
+        db->read_only_   = read_only;
+        // Before load_vectors(), for two reasons: a refused handle should not
+        // have parsed a 2 GB file first, and replay_wal() WRITES (it applies the
+        // log and then clears it), so it must not run on a file another process
+        // is mid-save on.
+        db->acquire_lock(!read_only);
         db->load_vectors();
         // Intentionally do NOT pre-create the "text" index. An empty HNSW index
         // preallocates ~70MB (1M-element link locks etc.); pre-creating it forced
@@ -1110,6 +1357,7 @@ public:
     void add(uint64_t id, const std::vector<float>& vec,
              const Metadata& meta = Metadata(),
              const std::string& modality = "text") {
+        check_writable("add a record");
         std::unique_lock<std::shared_mutex> lock(mutex_);
 
         // WAL: log before mutating in-memory state
@@ -1157,6 +1405,7 @@ public:
                    const std::vector<std::vector<float>>& vecs,
                    const std::vector<Metadata>& metas,
                    const std::string& modality = "text") {
+        check_writable("add a batch");
         std::unique_lock<std::shared_mutex> lock(mutex_);
         const size_t n = ids.size();
         if (n == 0) return;
@@ -1223,6 +1472,7 @@ public:
     void link(uint64_t from_id, uint64_t to_id,
               const std::string& rel_type = "related_to",
               float weight = 1.0f) {
+        check_writable("create an edge");
         std::unique_lock<std::shared_mutex> lock(mutex_);
         auto it = metadata_store_.find(from_id);
         if (it == metadata_store_.end()) return;
@@ -1528,6 +1778,7 @@ public:
     }
 
     void update_metadata(uint64_t id, const Metadata& meta) {
+        check_writable("update metadata");
         std::unique_lock<std::shared_mutex> lock(mutex_);
         // WAL
         {
@@ -1988,6 +2239,7 @@ public:
     // Soft-delete: mark-deleted in HNSW (exits search), blank content,
     // set importance=0. The node shell remains so graph edges stay traversable.
     void forget(uint64_t id) {
+        check_writable("forget a record");
         std::unique_lock<std::shared_mutex> lock(mutex_);
         wal_append(WalOp::FORGET, id, "");
         wal_sync();
@@ -2096,6 +2348,7 @@ public:
     // 7d: compact() — rebuild HNSW indices without soft-deleted records
     // ─────────────────────────────────────────────────────────────────
     size_t compact() {
+        check_writable("compact");
         std::unique_lock<std::shared_mutex> lock(mutex_);
         return compact_nolock();
     }
@@ -2182,11 +2435,15 @@ public:
         // `<path>.tmp` behind — the destructor had begun rewriting the file
         // from the fragment and only crashed before reaching std::rename.
         // Whether the original survived was down to where the crash landed.
-        if (load_complete_) {
+        // read_only_ is the second guard: a reader holds only a SHARED lock, so
+        // a checkpoint from here would rewrite the file while other readers —
+        // and possibly a writer waiting on it — are using it.
+        if (load_complete_ && !read_only_ && !closed_) {
             try { save_vectors(); } catch (...) {}
         }
         wal_close();   // save_vectors() clears the WAL on success; on failure
                        // the handle still has to be released
+        release_lock();
     }
 
     size_t dim(const std::string& modality = "text") const {

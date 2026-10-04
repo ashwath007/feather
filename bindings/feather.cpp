@@ -140,7 +140,18 @@ PYBIND11_MODULE(core, m) {
     // ── DB ───────────────────────────────────────────────────────────
     py::class_<feather::DB, std::unique_ptr<feather::DB, py::nodelete>>(m, "DB")
         .def_static("open", &feather::DB::open,
-                    py::arg("path"), py::arg("dim") = 768)
+                    py::arg("path"), py::arg("dim") = 768,
+                    py::arg("read_only") = false,
+                    "Open a .feather file.\n\n"
+                    "Takes an exclusive inter-process write lock; a second "
+                    "writer is refused with the holder's pid. read_only=True "
+                    "takes a shared lock instead, so many readers may hold the "
+                    "file at once, and every mutation raises.\n\n"
+                    "Feather is single-writer by design: for several agents in "
+                    "ONE process, share this handle and separate them by "
+                    "namespace, rather than opening the file twice. Set "
+                    "FEATHER_LOCK=0 to disable locking (concurrent writers then "
+                    "silently discard each other's records).")
 
         // -- Ingestion --
         .def("add", [](feather::DB& db, uint64_t id,
@@ -329,6 +340,17 @@ PYBIND11_MODULE(core, m) {
 
         // -- Persistence & info --
         .def("save", &feather::DB::save, py::call_guard<py::gil_scoped_release>())
+        .def("close", &feather::DB::close,
+             "Checkpoint and release the file lock. Needed because this binding "
+             "uses py::nodelete, so the C++ destructor never runs from Python — "
+             "without close() the lock lives until the process exits and the "
+             "file cannot be reopened. Idempotent.")
+        .def("is_read_only", &feather::DB::is_read_only)
+        .def("is_closed",    &feather::DB::is_closed)
+        .def("__enter__", [](feather::DB& db) -> feather::DB& { return db; })
+        .def("__exit__", [](feather::DB& db, py::object, py::object, py::object) {
+            db.close();
+        })
         .def("size", &feather::DB::size)
         .def("dim",  &feather::DB::dim, py::arg("modality") = "text")
 
