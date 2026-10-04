@@ -9,6 +9,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### FeatherStore now honours the whole `BaseStore` contract
+Four behaviours the LangGraph interface specifies that the first implementation
+either silently ignored or actively inverted. Each was found by exercising the
+contract rather than re-reading the code.
+
+- **TTL was unreachable.** `BaseStore.put()` refuses a `ttl` unless the subclass
+  sets `supports_ttl`, and raises *before* reaching `batch()` — so Feather's own
+  `ttl` field and `forget_expired()` could not be used through the LangGraph API
+  even though both already worked. Declared, and enforced on read.
+- **A sub-second TTL became permanent.** LangGraph's `ttl` is in *minutes*,
+  Feather stores whole *seconds*, and `0` means "never expires" — so
+  `int(0.001 * 60)` silently turned an expiring memory into a permanent one.
+  Now rounded and floored at one second: a positive TTL can never mean forever.
+- **`index=False` was ignored.** The placeholder vector is identical for every
+  unindexed record, so without a marker they matched each other perfectly and an
+  `index=False` item came back as the *top* semantic hit — the opposite of what
+  was asked. Unindexed records are now excluded from semantic results while
+  remaining stored and listable.
+- **`list_namespaces` ignored its match conditions.** Prefix, suffix and `*`
+  wildcards are now applied — and applied to the *full* namespace before
+  `max_depth` truncation, because truncating first lets `("a","b","c")` match a
+  suffix condition on `("b",)` at depth 2, a path the caller never stored.
+
+10 tests; **7 fail against the previous implementation.**
+
+
+### Feather over MCP, rebuilt for SDK 2.0 — and shaped like agent memory
+The existing `feather-serve` is **broken against the current SDK**: `Server.list_tools`
+was removed in MCP 2.0, so `create_server()` raises before it can start. It also
+exposed 16 low-level database verbs — a model handed `feather_add_intel`,
+`feather_mmr_search` and `feather_consolidate` has to work out which one means
+"remember this", and it usually decides not to.
+
+`feather-agent` replaces it with a surface shaped like what an agent does, using
+each MCP capability for what it is actually good at:
+
+- **Tools** (`remember`, `recall`, `context`, `forget`, `memory_stats`) — the
+  model calls these when it decides to. Good for recall, weak for capture.
+- **Prompts** (`/remember`, `/what-do-you-know`, `/catch-up`) — **user-invoked**,
+  which is the reliable capture path precisely because it does not depend on the
+  model choosing to act. This is the capability the old server never implemented.
+- **Resources** (`feather://context`, `feather://stats`) — attachable, so the
+  working set costs no tool call and no round trip.
+
+Backed by `Pocket`, so an agent reached over MCP gets the same hot/warm/cache
+tiering and scope inheritance: `--scope hawky.brand_a.creative` reads its own
+memory plus `hawky.brand_a` and `hawky`, and sibling agents cannot see each
+other. Memory survives a server restart because it is one file.
+
+    feather-agent --db agent.feather --scope hawky.brand_a.creative
+
+The `mcp` extra is pinned to **>=2.0.0** (0.9.0 predates both the stateless
+protocol core and the `MCPServer` API), and CI installs it on 3.10+ so this
+adapter cannot break silently again. 17 tests, including one that asserts the
+legacy server is still broken — if it ever passes, something changed and the
+replacement should be revisited.
+
+### Concurrency test no longer flakes on a loaded machine
+`test_concurrent_search_scales` took a single timing sample, which failed once
+in three runs on an otherwise-passing build. Scheduler noise and CPU contention
+can only make a timing run *slower*, so it now takes the best of three rounds —
+the fastest round is the honest estimate of what the lock permits.
+
+
 ### Agent pocket memory — hot / warm / cache tiering per agent
 An agent does not want "the top k for a query". It wants the things it should be
 carrying right now, sized to the context budget it has left. Answering that by
