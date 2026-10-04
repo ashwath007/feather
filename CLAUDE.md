@@ -437,6 +437,31 @@ mem.about()                                             # all kinds, one prefix 
 mem.recall("how to contact", kinds=["preferences"])
 ```
 
+```python
+# ── PacketBuilder: required context guaranteed, the rest budgeted ───────
+from feather_db import PacketBuilder, RequiredRule
+builder = PacketBuilder(pkt, budget_tokens=4000,
+                        resolve_required=mongo_rule_lookup)   # optional
+packet = builder.build(required=["compliance"], query="which hook")
+if not packet.may_mutate:
+    raise PolicyBlocked(packet.why_blocked())     # fail closed
+prompt = packet.text
+packet.manifest()    # refs + versions + omissions, for replay
+```
+
+**`hot()` is not a policy path.** It fits a budget by heat, so a binding rule
+can be crowded out by ordinary notes — silently. Anything that gates a mutation
+must go through `PacketBuilder`, which puts required refs first, judges the
+required set **whole**, and raises `RequiredContextUnavailable` rather than
+returning a partial constraint set. `allow_degraded=True` is for read-only help
+only.
+
+**`resolve_required=` makes an external store authoritative, with no pocket
+fallback.** That is deliberate: Feather is derived retrieval and indexing is
+asynchronous, so a pocket fallback would (a) turn index lag into "rule missing"
+and block every mutation, and (b) let a stale Feather copy of a just-changed
+rule be enforced as binding. A key the resolver does not return is missing.
+
 | kind | write semantics | get it wrong and… |
 |---|---|---|
 | `preferences` | upsert by key | six contradictory answers, none current |
