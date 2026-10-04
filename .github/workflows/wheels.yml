@@ -37,9 +37,16 @@ jobs:
         # v2.21 pinned a manylinux image that has since been removed from quay.io
         # ("No such image: manylinux2014_x86_64:2024.10.07-1"), which failed the
         # Linux leg independently of the macOS one.
-        uses: pypa/cibuildwheel@v2.23
+        # Bumped 2.23 → 4.2.1 for cp314. 2.23 predates Python 3.14, so adding
+        # cp314-* to it builds nothing. Verified by workflow_dispatch (which
+        # builds without publishing) before this reached a tag.
+        uses: pypa/cibuildwheel@v4.2.1
         env:
-          CIBW_BUILD: "cp38-* cp39-* cp310-* cp311-* cp312-* cp313-*"
+          CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
+          # cp38 dropped: cibuildwheel 4.x no longer builds it (3.8 is EOL since
+          # 2024-10). The sdist still installs on 3.8, and requires-python stays
+          # >=3.8, so nothing is cut off — 3.8 users compile instead of
+          # downloading, which is what they already did before 0.18.2.
           CIBW_SKIP: "*-musllinux_* *_i686 *-win32"
           # manylinux2014 (glibc 2.17, GCC 9) can no longer install a modern
           # numpy: there is no manylinux2014 wheel for cp312+, so pip falls back
