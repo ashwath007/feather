@@ -17,7 +17,32 @@
 - Graph visualizer — self-contained D3 force-graph HTML, fully offline
 - Single file persistence (`.feather` binary format, v9 with persisted HNSW graph for fast cold load, optional int8 on-disk and in-RAM; v3–v8 files load transparently)
 
-**Version:** `0.16.0` (Phase 8 — ingestion/load performance, in-RAM int8, Claude MCP connector, persisted HNSW graph / format v9)
+**Version:** `0.20.0` (Phase 9 — agent memory: pocket tiering, typed agent store, MCP over the real protocol, inter-process locking)
+
+> **Phase 9 (v0.19–v0.20) additions** — the agent-memory layer. Four modules,
+> all Python, sitting on the unchanged engine:
+> - **`feather_db/pocket.py`** — per-agent working memory with HOT / WARM /
+>   CACHE tiers. `hot()` returns a budget-fitted working set ranked by *heat*
+>   (`recency × use_weight × inherit_weight × importance`, pinned ⇒ 1.0);
+>   `recall()` reaches warm storage the budget could not carry. Scopes are
+>   dotted and **inherit**: `org.brand.creative` reads its own scope and every
+>   ancestor, decayed by `INHERIT_DECAY` per hop. `hot()` is memoised on
+>   `(budget, write-generation, second)` — it is O(namespace) cold (171 ms at
+>   10k) and 0.001 ms warm. `recall()` **invalidates** it, because `search()`
+>   increments `recall_count`: a read that is really a write.
+> - **`integrations/langgraph_store.py`** — `FeatherStore`, a LangGraph
+>   `BaseStore` (long-term, cross-thread memory, *not* `BaseCheckpointSaver`).
+>   Implements the two abstract methods, `batch`/`abatch`. Beyond the interface
+>   it adds `scan()` / `count()` / `newest()`, because `search()` has no
+>   ordering and no cheap count.
+> - **`integrations/agent_memory.py`** — `AgentMemory`, the five kinds an agent
+>   stores, with the lifetime of each enforced. See §5.5.
+> - **`integrations/mcp_agent.py`** — `feather-agent`, the MCP server shaped
+>   like agent memory (5 tools, 3 prompts, 2 resources). Replaces
+>   `mcp_server.py`, which is **broken against SDK 2.0** (`Server.list_tools`
+>   was removed, so `create_server()` raises on import).
+> - **Inter-process locking** — see §9 "File locking". `db.close()` is now
+>   required to release a file.
 
 > **Phase 8 (v0.13–v0.15) additions** — see `include/feather.h`, `feather_db/integrations/`:
 > - **Parallel HNSW load** (`parallel_add`): graph rebuilt across a thread pool on
@@ -88,14 +113,22 @@ feather/
 ├── feather_db/
 │   ├── __init__.py          # Python package exports (DB, Metadata, RelType, etc.)
 │   ├── filter.py            # Python FilterBuilder helper class
+│   ├── pocket.py            # ← Pocket: per-agent hot/warm/cache memory, scoped
 │   ├── domain_profiles.py   # DomainProfile base + MarketingProfile adapter
 │   ├── graph.py             # export_graph(), visualize(), RelType constants
-│   └── d3.min.js            # D3.js v7.9.0 inlined for offline visualization
+│   ├── d3.min.js            # D3.js v7.9.0 inlined for offline visualization
+│   └── integrations/
+│       ├── langgraph_store.py  # ← FeatherStore: LangGraph BaseStore
+│       ├── agent_memory.py     # ← AgentMemory: the five kinds (§5.5)
+│       ├── mcp_agent.py        # ← feather-agent: MCP server for SDK 2.0
+│       ├── mcp_server.py       #   BROKEN on SDK 2.0 — superseded, do not use
+│       ├── mcp_remote.py       #   MCP against the Cloud API instead of a file
+│       └── embedders.py        #   make_embedder() + default_embedder() (env)
 ├── feather-cli/             # Rust CLI crate (feather-db-cli)
 │   ├── src/main.rs          # CLI entry point
 │   ├── src/lib.rs           # CLI command implementations
 │   ├── build.rs             # Rust build script (links C++ core)
-│   └── Cargo.toml           # Rust package manifest (v0.12.0)
+│   └── Cargo.toml           # Rust package manifest (v0.20.0)
 ├── feather-api/             # FastAPI Cloud wrapper (v0.10 rewrite)
 │   ├── app/main.py          # FastAPI app + all /v1/* routes
 │   ├── app/db_manager.py    # DB lifecycle management + delete()
@@ -115,7 +148,7 @@ feather/
 ├── real_data/               # Real dataset files (not committed)
 ├── p-test/                  # Rust CLI integration tests
 ├── setup.py                 # Python build (compiles C++ extension)
-├── pyproject.toml           # PEP 517 metadata (version: 0.12.0)
+├── pyproject.toml           # PEP 517 metadata (version: 0.20.0)
 ├── MANIFEST.in              # Source distribution manifest
 └── CHANGELOG.md             # Version history
 ```
@@ -285,7 +318,7 @@ final_score     = ((1 - time_weight) * similarity + time_weight * recency) * imp
 
 ### Install
 ```bash
-pip install feather-db  # v0.12.0 on PyPI
+pip install feather-db  # v0.20.0 on PyPI (binary wheels, cp39-cp314)
 # or from source:
 python setup.py build_ext --inplace
 ```
@@ -372,6 +405,60 @@ meta = db.get_metadata(42)
 db.save()
 ```
 
+### 5.5 Agent memory — `Pocket`, `FeatherStore`, `AgentMemory`
+
+Three layers, each usable alone:
+
+```python
+# ── Pocket: one agent's working set, budget-fitted ───────────────────────
+from feather_db.pocket import pocket
+pkt = pocket(db, ("org", "brand", "creative"), budget_tokens=4000)
+pkt.remember("tone", "captions stay lowercase", pinned=True)
+pkt.hot()            # what to carry now, ranked by heat, trimmed to budget
+pkt.hot_text()       # the same, as a prompt-ready string
+pkt.recall("tone")   # reaches WARM storage the budget could not carry
+pkt.stats()          # hot/warm/cache counts, token usage, inherited scopes
+
+# ── FeatherStore: LangGraph long-term memory ─────────────────────────────
+from feather_db.integrations.langgraph_store import FeatherStore
+store = FeatherStore("agent.feather", dim=768)       # embed= defaults to env
+graph = builder.compile(store=store)                 # ← the whole integration
+
+# ── AgentMemory: the five kinds, lifetimes enforced ─────────────────────
+from feather_db.integrations import AgentMemory
+mem = AgentMemory(store, org="hawky", user="user_842", agent="creative", brand="nike")
+mem.preferences.set("comms", "prefers written async")   # revised in place
+mem.episodes.record("report shipped late", outcome="miss")  # append-only
+mem.facts.state("positioning", "premium")               # corrected, keeps history
+mem.procedures.define("weekly", ["pull", "send"])       # versioned as name@N
+mem.entities.enrich("nike", {"industry": "apparel"})    # merged, org-wide
+mem.observations.note("style", "decisive", evidence=["comms"])
+mem.about()                                             # all kinds, one prefix read
+mem.recall("how to contact", kinds=["preferences"])
+```
+
+| kind | write semantics | get it wrong and… |
+|---|---|---|
+| `preferences` | upsert by key | six contradictory answers, none current |
+| `episodes` | append-only, key embeds the event time | the history that made it an episode is gone |
+| `facts` | upsert, previous kept in `supersedes` | cannot answer "since when" |
+| `procedures` | new version each write, `name@N` retained | a regression cannot be diffed against what worked |
+| `entities` | merge into existing attributes | additions overwrite instead of accumulating |
+| `observations` | cites `evidence` keys | a drawn conclusion cannot be traced or retracted |
+
+**Namespace ordering is load-bearing.** Search takes a *prefix*, so
+`(org, subject, kind)` makes "everything about this user" a prefix read while
+`(org, kind, subject)` makes it a filter over every user in the org. Same data;
+the second does not scale. `AgentMemory` owns the ordering so a caller cannot
+invert it.
+
+**Never use `store.search(ns, query=None, limit=n)` to mean "the newest n".**
+`search` has no ordering, so it returns an arbitrary `n`; sorting those is
+sorting the wrong set. At 300 episodes it returned 299, 298, 296, 295, 293 —
+silently skipping two. Use `store.newest(ns, n, key=…)`, and `store.count(ns)`
+rather than `len(search(...))`. `count` cannot use the engine's
+`namespace_size()`, which counts tombstones until compaction.
+
 ### Domain Profiles
 
 ```python
@@ -399,7 +486,7 @@ data = export_graph(db, namespace_filter="nike")  # Python dict
 
 ## 6. Rust CLI (`feather-db-cli`)
 
-**Crate on Crates.io:** `feather-db-cli` v0.12.0
+**Crate on Crates.io:** `feather-db-cli` v0.20.0
 
 ```bash
 feather add    --db my.feather --id 1 --vec "0.1,0.2,0.3" --modality text
@@ -533,8 +620,41 @@ ever see a change "not take effect", `rm -rf build` and rebuild.
 ### Max elements per index (adaptive since v0.15.3)
 Each modality index starts at `INITIAL_MAX_ELEMENTS = 4096` and grows on demand: `reserve()` calls `resizeIndex()` (doubling) before any insert exceeds capacity. There is no hard ceiling — indices grow to fit whatever you store. `resizeIndex` is **not thread-safe**, so `reserve()` runs before `parallel_add` for the full batch size, never from inside it.
 
+### File locking — `close()` is now required (v0.20.0)
+`DB.open()` takes an **exclusive** advisory `flock` on `<path>.lock` for the
+handle's lifetime. A second *process* is refused, naming the holder's pid.
+`DB.open(..., read_only=True)` takes a *shared* lock instead, so many readers
+coexist, and every mutation on that handle raises at the call site.
+
+**What this does NOT do:** let two processes write one file. It cannot. Each DB
+holds the whole dataset in RAM and `save_vectors()` rewrites the file from that
+view, so serialising the saves would only decide *whose* records vanish
+(measured before the lock: 20 of 20 lost, both processes exiting 0). Concurrent
+writing needs merge-on-save or a paged store — a format change.
+
+Three consequences you will hit:
+
+1. **`db.close()` is required, not decorative.** The Python binding holds `DB`
+   with `py::nodelete`, so `~DB()` never runs from Python. Without `close()` the
+   lock lives until process exit and the file cannot be handed to a subprocess.
+   `del db` does **not** release it. `with DB.open(...) as db:` works.
+2. **The lock is reentrant within one process.** A strict lock would be a
+   breaking change for exactly the reason above — it refused programs their own
+   file, and broke 26 tests + 34 errors. Same-process double-open therefore
+   remains the documented footgun: use **one handle** and separate agents by
+   namespace/scope, or `mcp_agent.build(db=...)`.
+3. **`FEATHER_LOCK=0`** disables it (flock is unreliable on NFS and some overlay
+   mounts). The caller then owns the consequence.
+
+Keep the registry key in `lock_key()` on `realpath(dirname) + basename`, never
+on the file: `realpath` only resolves an existing file, and on macOS rewrites
+`/var/…` → `/private/var/…`, so keying on the file gave a different key before
+and after the first save — reentrancy missed and the handle reported *itself* as
+"another process (pid \<ourselves\>)".
+
 ### File saved on close
-`feather::DB::~DB()` calls `save()`. Call `db.save()` explicitly in long-running processes.
+`feather::DB::~DB()` calls `save()`. Call `db.save()` explicitly in long-running
+processes, and `db.close()` when done with the file.
 
 ### Dangling edges in `export_graph_json`
 If a record exists in the edge list but not in the metadata store (e.g., added without metadata), `export_graph_json` filters those dangling edges automatically via the `exported_ids` set.
@@ -554,6 +674,13 @@ When adding a new feature to Feather DB, touch these files **in order**:
 7. **`feather-cli/src/lib.rs`** — Add CLI command in Rust
 8. **`examples/`** — Add a usage example
 9. **`CHANGELOG.md`** — Document the change
+10. **`scripts/sync-cpp.sh`** — run it if you touched `include/` or `src/`; CI
+    fails on drift between `feather-cli/cpp/` and the originals
+11. **`./scripts/verify.sh`** — the gate. Nothing ships red.
+
+If the feature is agent-facing, it probably belongs in `feather_db/pocket.py`,
+`integrations/agent_memory.py` or `integrations/mcp_agent.py` rather than on
+`DB` — the engine stays generic and the memory model lives above it.
 
 ---
 
@@ -561,6 +688,7 @@ When adding a new feature to Feather DB, touch these files **in order**:
 
 | Issue | Details |
 |-------|---------|
+| ~~Two processes destroy each other's writes~~ | **Fixed in v0.20.0**: enforced single-writer / many-reader via `flock`. Still NOT concurrent multi-process *writing* — the second writer is refused, not queued. `db.close()` required to release. |
 | Writes are serialized (reads are not) | `mutex_` is a `std::shared_mutex`: retrieval + const accessors take it **shared** (concurrent), mutations take it **exclusively** (one writer at a time, and no reader runs alongside). Salience (`recall_count`/`last_recalled_at`) is `mutable std::atomic` so a query can record its hit under the shared lock. |
 | Soft deletes reclaimed on compaction | `forget()`/`purge()` mark vectors deleted; space is reclaimed by `compact()` or `set_auto_compact(ratio)` (Phase 7) |
 | int8 quantization (two modes) | `set_quantized()` shrinks the file; `set_int8_ram()` shrinks RAM (~1.7×, opt-in, lossy) via `Int8L2Space` |
@@ -569,14 +697,33 @@ When adding a new feature to Feather DB, touch these files **in order**:
 | `meta.attributes['k'] = v` no-op | pybind11 map copy; use `set_attribute()` |
 | Load time for large attribute DBs | v4/v5 attribute map deserialization is O(n * attrs); namespace/attribute *lookups* are O(matches) via secondary indexes (Phase 7) |
 | Rust CLI missing v0.5.0 features | namespace/entity/context_chain are Python-only for now |
+| Rust CLI now participates in locking | if a long-running Python process holds a DB, `feather add --db that.feather` is refused rather than silently discarding one side |
+| `mcp_server.py` is broken on SDK 2.0 | `Server.list_tools` was removed; `create_server()` raises on import. Use `mcp_agent.py` (`feather-agent`) |
+| BM25 fallback does no stemming | without an embedder, `allergic` matches but `allergy` does not, and the key is not indexed. A paraphrased query returns "nothing found", indistinguishable from "never stored" — set `FEATHER_EMBED_PROVIDER` for anything relying on paraphrase |
+| `all()` ties within one second | the engine timestamp is whole seconds, so items written in the same second order arbitrarily. `_Episodes` overrides this using the event time in the key; sub-second ordering needs format v10's second timestamp |
 
 ---
 
 ## 12. Testing
 
 ```bash
+# One command, the pre-release gate — build, suite, format scripts, the four
+# data-loss regressions, MCP over the protocol, vendored C++ sync, version
+# consistency, release prereqs, live API contract. Exits non-zero on anything.
+./scripts/verify.sh            # or `./scripts/verify.sh quick`
+
+pytest tests -q --deselect tests/test_engine.py::TestProviderInterface::test_provider_str
+# 488 passed as of v0.20.0. The deselected test needs `openai` installed.
+
+# The agent-memory suites specifically:
+pytest tests/test_pocket.py tests/test_agent_memory.py \
+       tests/test_langgraph_store.py tests/test_file_locking.py -q
+# MCP over a real ClientSession (not direct calls) — must RUN, not skip:
+pytest tests/test_mcp_protocol.py tests/test_mcp_personas.py -q
+
 source repro_venv/bin/activate
 
+python3 examples/langgraph_agent_memory.py   # memory added to an agent in 1 line
 python3 examples/context_graph_demo.py
 python3 examples/marketing_living_context.py
 python3 examples/feather_inspector.py   # local inspector at http://localhost:7777
@@ -602,4 +749,5 @@ cd p-test && ./run_tests.sh   # Rust CLI tests
 | Cloud | Done | FastAPI admin SPA + pluggable embeddings (v0.10 Cloud Edition) |
 | Phase 7 | Done | Secondary metadata indexes, pre-filtered ANN, auto-compaction (v0.11.0), on-disk int8 quantization / format v7 (v0.12.0) |
 | Phase 8 | Done | Parallel load + `add_batch`, SIMD-on-x86 (v0.13.0), in-RAM int8 / format v8 (v0.15.0), Claude MCP connector + real embedders (v0.14–v0.15), adaptive index capacity (v0.15.3), persisted HNSW graph / format v9 (v0.16.0) |
-| Phase 9 | Planned | Multi-tenant auth, in-RAM int8 SIMD distance, GTM (PyPI/crates publish) |
+| Phase 9 | Done | Agent memory: `Pocket` hot/warm/cache tiering, `FeatherStore` (LangGraph `BaseStore`), `AgentMemory`'s five kinds, `feather-agent` MCP server for SDK 2.0 tested over the real protocol, inter-process file locking (v0.19–v0.20) |
+| Phase 10 | Planned | Format v10 (length-prefixed records, deletion flags, metric tag, typed attributes, bitemporal, footer) — which also turns three `FeatherStore` Python workarounds into engine features: namespace-prefix indexing, typed attributes for real comparisons, a second timestamp. Plus multi-tenant auth, in-RAM int8 SIMD distance |
