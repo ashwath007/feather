@@ -32,7 +32,7 @@ from .engine import ContextEngine
 __all__ = [
     "Pocket", "PocketItem", "pocket", "scoped_id",
     "PacketBuilder", "ContextPacket", "Ref", "Omission",
-    "RequiredContextUnavailable",
+    "RequiredRule", "RequiredContextUnavailable",
     "DB", "ContextType", "Metadata", "ScoringConfig",
     "Edge", "IncomingEdge",
     "ContextNode", "ContextEdge", "ContextChainResult",
@@ -63,7 +63,7 @@ __version__ = "0.20.0"
 def __getattr__(name):
     import importlib
     if name in ("PacketBuilder", "ContextPacket", "Ref", "Omission",
-                "RequiredContextUnavailable"):
+                "RequiredRule", "RequiredContextUnavailable"):
         return getattr(importlib.import_module("feather_db.packet"), name)
     if name == "scoped_id":
         return getattr(importlib.import_module("feather_db.pocket"), name)

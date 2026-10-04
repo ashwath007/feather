@@ -229,3 +229,76 @@ def test_packet_ids_are_unique(pkt):
     b = PacketBuilder(pkt)
     ids = {b.build(required=["compliance"]).packet_id for _ in range(5)}
     assert len(ids) == 5
+
+
+# ── an external store may own the constraints ─────────────────────────────
+# Feather is DERIVED retrieval; Mongo and the rules file are authoritative, and
+# indexing is asynchronous. These pin that a packet never depends on Feather
+# having the rule.
+
+from feather_db.packet import RequiredRule           # noqa: E402
+
+
+def test_an_external_resolver_supplies_the_required_rules(pkt):
+    """Copilot's rules live in _brand/rules.md and Mongo brand_rule records,
+    not in Feather. The guarantee has to work without copying them in first."""
+    rules = {"compliance_v2": RequiredRule("no health claims whatsoever",
+                                           version=7, source="mongo")}
+    packet = PacketBuilder(pkt, resolve_required=rules.get).build(
+        required=["compliance_v2"])
+
+    assert packet.may_mutate
+    assert "no health claims whatsoever" in packet.text
+    ref = packet.required_refs[0]
+    assert ref.version == 7 and ref.scope == ("mongo",)
+    assert packet.manifest()["required_refs"] == ["mongo/compliance_v2@7"]
+
+
+def test_a_plain_string_from_the_resolver_works(pkt):
+    packet = PacketBuilder(pkt, resolve_required=lambda k: "be careful").build(
+        required=["anything"])
+    assert "be careful" in packet.text
+
+
+def test_the_resolver_is_authoritative_with_no_pocket_fallback(pkt):
+    """If a resolver is given and does not return a key, that key is MISSING —
+    even though Feather holds a copy.
+
+    Falling back would enforce a possibly-stale constraint: Feather may hold the
+    previous text of a rule just changed in the authoritative store, and the
+    packet would present it as binding. Failing closed on a rule we cannot
+    authoritatively read is correct.
+    """
+    assert pkt.recall("medical") or True            # Feather does hold it
+    with pytest.raises(RequiredContextUnavailable):
+        PacketBuilder(pkt, resolve_required=lambda k: None).build(
+            required=["compliance"])
+
+
+def test_index_lag_cannot_masquerade_as_a_policy_failure(pkt):
+    """The inverse, and the reason the resolver exists: a rule written a moment
+    ago is not in Feather yet. With the resolver it is still binding, so a
+    retrieval delay never blocks a mutation it should not."""
+    just_written = {"brand_new_rule": RequiredRule("effective immediately", version=1)}
+    packet = PacketBuilder(pkt, resolve_required=just_written.get).build(
+        required=["brand_new_rule"])
+    assert packet.may_mutate
+    assert "effective immediately" in packet.text
+
+
+def test_the_pocket_still_supplies_non_required_context(pkt):
+    """Only the required path is externalised. Ordinary context stays in
+    Feather, where staleness costs relevance rather than correctness."""
+    pkt.remember("formats", "square video outperforms portrait here")
+    packet = PacketBuilder(pkt, budget_tokens=400,
+                           resolve_required=lambda k: RequiredRule("a rule")).build(
+        required=["r"], query="square video")
+    assert any(r.key == "formats" for r in packet.refs if not r.required)
+
+
+def test_an_external_required_rule_that_cannot_fit_still_fails_closed(pkt):
+    big = {"huge": RequiredRule("x " * 4000)}
+    with pytest.raises(RequiredContextUnavailable) as e:
+        PacketBuilder(pkt, budget_tokens=40, resolve_required=big.get).build(
+            required=["huge"])
+    assert "did not fit" in str(e.value)

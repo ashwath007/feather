@@ -68,6 +68,19 @@ class Ref:
 
 
 @dataclass(frozen=True)
+class RequiredRule:
+    """A required constraint supplied by an authoritative store.
+
+    Returned by a `resolve_required` callable. `version` and `source` are
+    recorded in the manifest so a decision can be revalidated against the store
+    that owns the rule rather than against Feather's copy of it.
+    """
+    text: str
+    version: Optional[int] = None
+    source: str = "external"
+
+
+@dataclass(frozen=True)
 class Omission:
     ref: str
     reason: str
@@ -217,9 +230,33 @@ class PacketBuilder:
 
     def __init__(self, pocket: Pocket, *, budget_tokens: Optional[int] = None,
                  count_tokens: Optional[Callable[[str], int]] = None,
+                 resolve_required: Optional[Callable[[str], Any]] = None,
                  required_header: str = "OPERATING CONSTRAINTS (binding)",
                  context_header: str = "CONTEXT"):
+        """`resolve_required(key)` makes an external store authoritative for
+        constraints, returning a `RequiredRule`, a plain string, or None.
+
+        This matters more than it looks. Feather is *derived* retrieval — the
+        authoritative memory and its revisions live elsewhere (Mongo, a rules
+        file), and indexing is asynchronous. If required rules had to be found
+        in Feather, two things would follow, both bad:
+
+        1. Index lag becomes an outage. A rule written a second ago is not in
+           Feather yet, so it reads as missing, so every dependent mutation is
+           blocked. A retrieval delay would masquerade as a policy failure.
+        2. A stale copy becomes enforceable. Feather might hold the *previous*
+           text of a rule that was just changed, and a packet would present it
+           as binding.
+
+        So when a resolver is given it is authoritative and there is NO fallback
+        to the pocket for required refs: a key the resolver does not return is
+        missing, full stop. Failing closed on a rule we cannot authoritatively
+        read is correct; silently substituting a possibly-stale copy is not.
+        The pocket still supplies the non-required context, where staleness
+        costs relevance rather than correctness.
+        """
         self.pocket = pocket
+        self.resolve_required = resolve_required
         self.budget = budget_tokens if budget_tokens is not None else pocket.budget
         if count_tokens is not None:
             self._count, self.exact = count_tokens, True
@@ -250,6 +287,25 @@ class PacketBuilder:
             return rid, meta, scope, depth
         return None, None, (), 0
 
+    def _resolve_required_one(self, key: str):
+        """(text, version, scope) for a required key, or (None, None, ()).
+
+        The external resolver wins outright when present — see __init__ for why
+        there is deliberately no pocket fallback.
+        """
+        if self.resolve_required is not None:
+            found = self.resolve_required(key)
+            if found is None:
+                return None, None, ()
+            if isinstance(found, RequiredRule):
+                return found.text, found.version, (found.source,)
+            return str(found), None, ("external",)
+
+        rid, meta, scope, _depth = self._resolve(key)
+        if meta is None:
+            return None, None, ()
+        return meta.content, meta.recall_count, tuple(scope)
+
     def build(self, *, required: Iterable[str] = (), query: Optional[str] = None,
               k: int = 10, budget_tokens: Optional[int] = None,
               allow_degraded: bool = False) -> ContextPacket:
@@ -278,16 +334,16 @@ class PacketBuilder:
             if key in seen:
                 packet.omitted.append(Omission(key, DUPLICATE, 0, True))
                 continue
-            rid, meta, scope, _depth = self._resolve(key)
-            if meta is None:
+            text, version, scope = self._resolve_required_one(key)
+            if text is None:
                 packet.omitted.append(Omission(key, MISSING, 0, True))
                 continue
-            block = f"- {meta.content}"
+            block = f"- {text}"
             cost = self._count(block)
             required_tokens += cost
             seen.add(key)
             required_blocks.append(block)
-            packet.refs.append(Ref(key, tuple(scope), meta.recall_count, cost, True))
+            packet.refs.append(Ref(key, scope, version, cost, True))
 
         # Budget check on the WHOLE required set, not item by item: a caller
         # needs to know its rules do not fit, not watch them disappear one at a
