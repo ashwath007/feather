@@ -102,9 +102,13 @@ loss:
 - `DB.open()` takes an exclusive advisory lock (`flock`) for the handle's
   lifetime. A second **process** is refused, naming the holder's pid and the
   single-writer model.
-- `DB.open(..., read_only=True)` takes a *shared* lock instead, so any number of
-  reader processes may hold the file at once. Every mutation on a read-only
-  handle raises at the call site — not at save time, because a handle that
+- `DB.open(..., read_only=True)` takes **no lock** and is never blocked, even
+  while a writer holds the file — single-writer, *unlimited*-reader. Safe
+  because `save_vectors()` renames a complete temp file over the original, so a
+  reader always has a whole inode and keeps a consistent snapshot until it
+  reopens; and because WAL replay is CRC-checked per record and a read-only
+  handle never clears the log. Readers trade freshness, not integrity. Every
+  mutation on a read-only handle raises at the call site — not at save time, because a handle that
   accepts `add()` and only complains on checkpoint has already lied to the
   caller. A read-only close never rewrites the file.
 - `db.close()` checkpoints, releases the WAL handle and drops the lock. It is

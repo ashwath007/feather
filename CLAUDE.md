@@ -623,8 +623,22 @@ Each modality index starts at `INITIAL_MAX_ELEMENTS = 4096` and grows on demand:
 ### File locking — `close()` is now required (v0.20.0)
 `DB.open()` takes an **exclusive** advisory `flock` on `<path>.lock` for the
 handle's lifetime. A second *process* is refused, naming the holder's pid.
-`DB.open(..., read_only=True)` takes a *shared* lock instead, so many readers
-coexist, and every mutation on that handle raises at the call site.
+`DB.open(..., read_only=True)` takes **no lock at all** and is never blocked,
+even while a writer holds the file. Every mutation on that handle raises at the
+call site.
+
+That is safe, not sloppy: `save_vectors()` writes `<path>.tmp` and `rename()`s
+it over the original, so `open()` returns either the complete old inode or the
+complete new one, and a reader keeps reading its own consistent snapshot until
+it reopens. WAL records carry a CRC32 and replay stops at the first mismatch, so
+replaying a log the writer is appending to yields a clean prefix; a read-only
+handle never calls `save_vectors()`, so it never clears the writer's WAL. What a
+reader gives up is **freshness, not integrity** — reopen to advance.
+
+A shared lock was the first implementation and was wrong: `LOCK_SH` conflicts
+with the writer's `LOCK_EX`, so every reader was refused while the writer merely
+held the handle open. That blocks the one topology this is for — a single writer
+service plus many agent processes reading the same file.
 
 **What this does NOT do:** let two processes write one file. It cannot. Each DB
 holds the whole dataset in RAM and `save_vectors()` rewrites the file from that

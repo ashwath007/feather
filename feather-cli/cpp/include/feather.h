@@ -768,6 +768,30 @@ private:
 
     void acquire_lock(bool exclusive) {
         if (!locking_enabled()) return;
+
+        // READERS TAKE NO LOCK, deliberately.
+        //
+        // A shared lock would buy nothing and cost the architecture that needs
+        // this most: one writer service plus many agent processes reading the
+        // same brand's file. LOCK_SH conflicts with the writer's LOCK_EX, so
+        // every reader was refused while the writer simply held the handle
+        // open — not even while saving.
+        //
+        // Nothing is given up, because save_vectors() writes `<path>.tmp` and
+        // then std::rename()s it over the original. open() therefore returns
+        // either the complete old inode or the complete new one, never a
+        // half-written file, and a reader that opened before the rename keeps
+        // reading its own consistent snapshot of the old inode until it
+        // reopens. The WAL is safe for the same kind of reason: every record
+        // carries a CRC32 and replay stops at the first mismatch, so a reader
+        // replaying a log the writer is appending to sees a clean prefix. A
+        // read-only handle never calls save_vectors(), so it never clears the
+        // writer's WAL either.
+        //
+        // What a reader gives up is freshness, not integrity: it sees the file
+        // as of its open. Reopen (or go through the writer) to advance.
+        if (!exclusive) return;
+
         lock_path_ = path_ + ".lock";
         lock_key_  = lock_key(path_);
         {
@@ -798,15 +822,15 @@ private:
                 return;
             }
             throw std::runtime_error(
-                std::string(exclusive
-                    ? "Cannot open '" + path_ + "' for writing: another process "
-                      "(pid " + holder + ") holds the write lock.\n"
-                    : "Cannot open '" + path_ + "' for reading: a writer "
-                      "(pid " + holder + ") holds it exclusively.\n") +
-                "Feather is single-writer: one process writes, many may read. "
-                "Set FEATHER_LOCK=0 to disable this check (you then own the "
-                "consequence: concurrent writers silently discard each other's "
-                "records).");
+                "Cannot open '" + path_ + "' for writing: another process (pid "
+                + holder + ") holds the write lock.\n"
+                "Feather is single-writer, many-reader. Readers are never "
+                "blocked — open with read_only=true, which takes no lock and "
+                "gives a consistent snapshot as of the open. If you need a "
+                "second WRITER, route its writes through the process that owns "
+                "the file. Set FEATHER_LOCK=0 to disable this check (you then "
+                "own the consequence: concurrent writers silently discard each "
+                "other's records).");
         }
         lock_fd_ = fd;
         {
