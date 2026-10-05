@@ -52,7 +52,7 @@ __all__ = [
 ]
 from .pocket import Pocket, PocketItem, pocket  # noqa: E402
 
-__version__ = "0.20.0"
+__version__ = "0.21.0"
 
 
 # ── Context packets (Phase 9) ────────────────────────────────────────────

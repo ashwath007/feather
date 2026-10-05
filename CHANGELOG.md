@@ -9,8 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Everything here landed **after** the v0.20.0 tag, so it is on master and not on
-PyPI. 0.20.0 users do not have it.
+## [0.21.0] — 2026-10-05
+
+Everything here landed after the v0.20.0 tag. The headline is a correctness fix
+for a defect that **was live in 0.20.0**: `recent()` and `len()` returned wrong
+answers past a handful of records.
+
+### `confidence_gte` — filter on how certain a record is
+
+`Metadata.confidence` has been stored and persisted since Phase 2 but was never
+in `SearchFilter`, so a caller could record how sure it was about a fact and
+then had no way to ask for only the sure ones.
+
+Deliberately a separate axis from `importance`: importance is how much a record
+matters, confidence is how likely it is to be true. A critical rule believed
+weakly and a trivial fact known for certain are not the same thing, and
+collapsing them loses the distinction that makes either useful. Unset records
+default to `1.0`, so records written before anyone used the field do not vanish
+the moment someone filters on it.
+
+```python
+f = FilterBuilder().namespace("brand.b1.shared.findings").min_confidence(0.9).build()
+```
 
 ### `recent()` and `all()` returned an arbitrary N, not the newest N
 
